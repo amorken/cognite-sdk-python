@@ -19,6 +19,7 @@ from msal import ConfidentialClientApplication, PublicClientApplication, Seriali
 
 from cognite.client.exceptions import CogniteAuthError
 from cognite.client.utils._auxiliary import at_least_one_is_not_none, exactly_one_is_not_none, load_resource_to_dict
+from cognite.client._http_client import get_global_httpx_client
 
 _TOKEN_EXPIRY_LEEWAY_SECONDS_DEFAULT = 30  # Do not change without also updating all the docstrings using it
 
@@ -227,6 +228,8 @@ class _WithMsalSerializableTokenCache:
         mem_cache_only: bool = False,
     ) -> PublicClientApplication:
         from cognite.client.config import global_config
+        # **** ADDED LINE ****
+        http_client = get_global_httpx_client()
 
         if authority_url and oauth_discovery_url:
             raise ValueError(
@@ -242,11 +245,13 @@ class _WithMsalSerializableTokenCache:
             client_id=client_id,
             authority=authority_url,
             token_cache=serializable_token_cache,
-            verify=not global_config.disable_ssl,
+            verify=not global_config.disable_ssl, # This verify is for MSAL's own potential cert validation if it were to use requests default. We pass our httpx client, which has its own verify logic.
             oidc_authority=oauth_discovery_url,
             # These two must be set to `False` to support non-Entra authorities.
             instance_discovery=False,
             validate_authority=False,
+            # **** ADDED PARAMETER ****
+            http_client=http_client,
         )
 
     @staticmethod
@@ -946,10 +951,15 @@ class OAuthClientCertificate(_OAuthCredentialProviderWithTokenRefresh):
         self.__certificate = certificate
         self.__scopes = scopes
 
+        # **** ADDED LINE ****
+        http_client = get_global_httpx_client()
+
         self.__app = ConfidentialClientApplication(
             client_id=self.__client_id,
             authority=self.__authority_url,
             client_credential={"thumbprint": self.__cert_thumbprint, "private_key": self.__certificate},
+            # **** ADDED PARAMETER ****
+            http_client=http_client,
         )
 
     @property
