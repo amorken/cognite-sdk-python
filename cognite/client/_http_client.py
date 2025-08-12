@@ -6,11 +6,17 @@ import socket
 import time
 from collections.abc import Callable, Iterable, MutableMapping
 from http import cookiejar
-from typing import Any, Literal
+from typing import Any, Literal, Union
 
 import requests
 import requests.adapters
 import urllib3
+import httpx
+import httpcore
+import sys
+
+print(f"httpx version: {httpx.__version__}", file=sys.stderr)
+print(f"httpcore version: {httpcore.__version__}", file=sys.stderr)
 
 from cognite.client.config import global_config
 from cognite.client.exceptions import CogniteConnectionError, CogniteConnectionRefused, CogniteReadTimeout
@@ -41,6 +47,16 @@ def get_global_requests_session() -> requests.Session:
     if global_config.proxies is not None:
         session.proxies.update(global_config.proxies)
     return session
+
+
+@functools.lru_cache(1)
+def get_global_httpx_client() -> httpx.Client:
+    return httpx.Client(
+        mounts={k: httpx.HTTPProxy(v) for k, v in global_config.proxies.items()} if global_config.proxies else None,
+        verify=not global_config.disable_ssl,
+        limits=httpx.Limits(max_connections=global_config.max_connection_pool_size),
+        follow_redirects=False,
+    )
 
 
 class HTTPClientConfig:
@@ -100,7 +116,7 @@ class HTTPClient:
     def __init__(
         self,
         config: HTTPClientConfig,
-        session: requests.Session,
+        session: Union[requests.Session, httpx.Client],
         refresh_auth_header: Callable[[MutableMapping[str, Any]], None],
         retry_tracker_factory: Callable[[HTTPClientConfig], _RetryTracker] = _RetryTracker,
     ) -> None:
@@ -108,6 +124,9 @@ class HTTPClient:
         self.config = config
         self.refresh_auth_header = refresh_auth_header
         self.retry_tracker_factory = retry_tracker_factory  # needed for tests
+        if isinstance(session, httpx.Client):
+            # Disable httpx retries, we are doing our own thing.
+            session.transport = httpx.HTTPTransport(retries=0)
 
     def request(
         self,
@@ -117,9 +136,9 @@ class HTTPClient:
         headers: MutableMapping[str, Any] | None = None,
         timeout: float | None = None,
         params: dict[str, Any] | str | bytes | None = None,
-        stream: bool | None = None,
+        stream: bool = False,
         allow_redirects: bool = False,
-    ) -> requests.Response:
+    ) -> Union[requests.Response, httpx.Response]:
         retry_tracker = self.retry_tracker_factory(self.config)
         accepts_json = (headers or {}).get("accept") == "application/json"
         is_auto_retryable = False
@@ -172,45 +191,56 @@ class HTTPClient:
         headers: MutableMapping[str, Any] | None = None,
         timeout: float | None = None,
         params: dict[str, Any] | str | bytes | None = None,
-        stream: bool | None = None,
+        stream: bool = False,
         allow_redirects: bool = False,
-    ) -> requests.Response:
-        """requests/urllib3 adds 2 or 3 layers of exceptions on top of built-in networking exceptions.
-
-        Sometimes the appropriate built-in networking exception is not in the context, sometimes the requests
-        exception is not in the context, so we need to check for the appropriate built-in exceptions,
-        urllib3 exceptions, and requests exceptions.
-        """
-        try:
-            res = self.session.request(
-                method=method,
-                url=url,
-                data=data,
-                headers=headers,
-                timeout=timeout,
-                params=params,
-                stream=stream,
-                allow_redirects=allow_redirects,
-            )
-            return res
-        except Exception as e:
-            if self._any_exception_in_context_isinstance(
-                e, (socket.timeout, urllib3.exceptions.ReadTimeoutError, requests.exceptions.ReadTimeout)
-            ):
+    ) -> Union[requests.Response, httpx.Response]:
+        if isinstance(self.session, httpx.Client):
+            try:
+                return self.session.request(
+                    method=method,
+                    url=url,
+                    content=data,
+                    headers=headers,
+                    timeout=timeout,
+                    params=params,
+                    follow_redirects=allow_redirects,
+                )
+            except httpx.ReadTimeout as e:
                 raise CogniteReadTimeout from e
-            if self._any_exception_in_context_isinstance(
-                e,
-                (
-                    ConnectionError,
-                    urllib3.exceptions.ConnectionError,
-                    urllib3.exceptions.ConnectTimeoutError,
-                    requests.exceptions.ConnectionError,
-                ),
-            ):
-                if self._any_exception_in_context_isinstance(e, ConnectionRefusedError):
-                    raise CogniteConnectionRefused from e
+            except httpx.ConnectError as e:
                 raise CogniteConnectionError from e
-            raise e
+
+        elif isinstance(self.session, requests.Session):
+            try:
+                return self.session.request(
+                    method=method,
+                    url=url,
+                    data=data,
+                    headers=headers,
+                    timeout=timeout,
+                    params=params,
+                    stream=stream,
+                    allow_redirects=allow_redirects,
+                )
+            except Exception as e:
+                if self._any_exception_in_context_isinstance(
+                    e, (socket.timeout, urllib3.exceptions.ReadTimeoutError, requests.exceptions.ReadTimeout)
+                ):
+                    raise CogniteReadTimeout from e
+                if self._any_exception_in_context_isinstance(
+                    e,
+                    (
+                        ConnectionError,
+                        urllib3.exceptions.ConnectionError,
+                        urllib3.exceptions.ConnectTimeoutError,
+                        requests.exceptions.ConnectionError,
+                    ),
+                ):
+                    if self._any_exception_in_context_isinstance(e, ConnectionRefusedError):
+                        raise CogniteConnectionRefused from e
+                    raise CogniteConnectionError from e
+                raise e
+        raise TypeError(f"session must be of type requests.Session or httpx.Client, not {type(self.session)}")
 
     @classmethod
     def _any_exception_in_context_isinstance(

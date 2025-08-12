@@ -3,8 +3,10 @@ from __future__ import annotations
 import functools
 import gzip
 import itertools
+import json
 import logging
 import re
+import sys
 import warnings
 from collections import UserList
 from collections.abc import Iterator, Mapping, MutableMapping, Sequence
@@ -15,17 +17,16 @@ from typing import (
     Literal,
     NoReturn,
     TypeVar,
+    Union,
     cast,
     overload,
 )
 from urllib.parse import urljoin
 
-import requests.utils
-from requests import Response
-from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
-from requests.structures import CaseInsensitiveDict
+import requests
+import httpx
 
-from cognite.client._http_client import HTTPClient, HTTPClientConfig, get_global_requests_session
+from cognite.client._http_client import HTTPClient, HTTPClientConfig, get_global_httpx_client, get_global_requests_session
 from cognite.client.config import global_config
 from cognite.client.data_classes._base import (
     CogniteFilter,
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=CogniteObject)
+T_CogniteResponse = Union[requests.Response, httpx.Response]
 
 VALID_AGGREGATIONS = {"count", "cardinalityValues", "cardinalityProperties", "uniqueValues", "uniqueProperties"}
 
@@ -127,7 +129,11 @@ class APIClient:
         self._UPDATE_LIMIT = 1000
 
     def _init_http_clients(self) -> None:
-        session = get_global_requests_session()
+        if "pyodide" in sys.modules:
+            session = get_global_requests_session()
+        else:
+            session = get_global_httpx_client()
+
         self._http_client = HTTPClient(
             config=HTTPClientConfig(
                 status_codes_to_retry={429},
@@ -157,12 +163,12 @@ class APIClient:
 
     def _delete(
         self, url_path: str, params: dict[str, Any] | None = None, headers: dict[str, Any] | None = None
-    ) -> Response:
+    ) -> T_CogniteResponse:
         return self._do_request("DELETE", url_path, params=params, headers=headers, timeout=self._config.timeout)
 
     def _get(
         self, url_path: str, params: dict[str, Any] | None = None, headers: dict[str, Any] | None = None
-    ) -> Response:
+    ) -> T_CogniteResponse:
         return self._do_request("GET", url_path, params=params, headers=headers, timeout=self._config.timeout)
 
     def _post(
@@ -172,7 +178,7 @@ class APIClient:
         params: dict[str, Any] | None = None,
         headers: dict[str, Any] | None = None,
         api_subversion: str | None = None,
-    ) -> Response:
+    ) -> T_CogniteResponse:
         return self._do_request(
             "POST",
             url_path,
@@ -185,7 +191,7 @@ class APIClient:
 
     def _put(
         self, url_path: str, json: dict[str, Any] | None = None, headers: dict[str, Any] | None = None
-    ) -> Response:
+    ) -> T_CogniteResponse:
         return self._do_request("PUT", url_path, json=json, headers=headers, timeout=self._config.timeout)
 
     def _do_request(
@@ -195,7 +201,7 @@ class APIClient:
         accept: str = "application/json",
         api_subversion: str | None = None,
         **kwargs: Any,
-    ) -> Response:
+    ) -> T_CogniteResponse:
         is_retryable, full_url = self._resolve_url(method, url_path)
         json_payload = kwargs.pop("json", None)
         headers = self._configure_headers(
@@ -250,8 +256,9 @@ class APIClient:
     def _configure_headers(
         self, accept: str, additional_headers: dict[str, str], api_subversion: str | None = None
     ) -> MutableMapping[str, Any]:
-        headers: MutableMapping[str, Any] = CaseInsensitiveDict()
-        headers.update(requests.utils.default_headers())
+        headers: MutableMapping[str, Any] = requests.structures.CaseInsensitiveDict()
+        if "pyodide" not in sys.modules:
+            headers.update(requests.utils.default_headers())
         self._refresh_auth_header(headers)
         headers["content-type"] = "application/json"
         headers["accept"] = accept
@@ -1290,7 +1297,7 @@ class APIClient:
             cleared[to_camel_case(prop.name)] = clear_with
         return cleared
 
-    def _raise_no_project_access_error(self, res: Response) -> NoReturn:
+    def _raise_no_project_access_error(self, res: T_CogniteResponse) -> NoReturn:
         raise CogniteProjectAccessError(
             client=self._cognite_client,
             project=self._cognite_client._config.project,
@@ -1298,7 +1305,7 @@ class APIClient:
             cluster=self._config.cdf_cluster,
         )
 
-    def _raise_api_error(self, res: Response, payload: dict) -> NoReturn:
+    def _raise_api_error(self, res: T_CogniteResponse, payload: dict) -> NoReturn:
         x_request_id = res.headers.get("X-Request-Id")
         code = res.status_code
         missing = None
@@ -1349,7 +1356,7 @@ class APIClient:
             cluster=self._config.cdf_cluster,
         )
 
-    def _log_request(self, res: Response, **kwargs: Any) -> None:
+    def _log_request(self, res: T_CogniteResponse, **kwargs: Any) -> None:
         method = res.request.method
         url = res.request.url
         status_code = res.status_code
@@ -1366,7 +1373,10 @@ class APIClient:
         extra["response_headers"] = res.headers
 
         try:
-            http_protocol = f"HTTP/{'.'.join(str(res.raw.version))}"
+            if isinstance(res, httpx.Response):
+                http_protocol = res.http_version
+            else:
+                http_protocol = f"HTTP/{'.'.join(str(res.raw.version))}"
         except AttributeError:
             # If this fails, it means we are running in a browser (pyodide) with patched requests package:
             http_protocol = "XMLHTTP"
@@ -1374,10 +1384,10 @@ class APIClient:
         logger.debug(f"{http_protocol} {method} {url} {status_code}", extra=extra)
 
     @staticmethod
-    def _get_response_content_safe(res: Response) -> str:
+    def _get_response_content_safe(res: T_CogniteResponse) -> str:
         try:
             return _json.dumps(res.json())
-        except (JSONDecodeError, RequestsJSONDecodeError):
+        except (JSONDecodeError, json.JSONDecodeError, requests.exceptions.JSONDecodeError):
             pass
 
         try:

@@ -1,7 +1,8 @@
 from unittest.mock import MagicMock
 
 import pytest
-import requests.exceptions
+import requests
+import httpx
 import urllib3.exceptions
 
 from cognite.client._http_client import HTTPClient, HTTPClientConfig, _RetryTracker
@@ -71,7 +72,7 @@ class TestRetryTracker:
         assert rt.should_retry(409, is_auto_retryable=False) is False
 
 
-def raise_exception_wrapped_as_in_requests_lib(exc: Exception):
+def raise_requests_exception(exc: Exception):
     try:
         raise exc
     except type(exc):
@@ -81,20 +82,30 @@ def raise_exception_wrapped_as_in_requests_lib(exc: Exception):
             raise requests.exceptions.RequestException
 
 
+@pytest.fixture(params=["requests", "httpx"])
+def session(request):
+    if request.param == "requests":
+        yield MagicMock(spec=requests.Session)
+    elif request.param == "httpx":
+        yield MagicMock(spec=httpx.Client)
+
+
 class TestHTTPClient:
-    def test_read_timeout_errors(self):
+    def test_read_timeout_errors(self, session):
         cnf = DEFAULT_CONFIG
         cnf.max_backoff_seconds = 0
         retry_tracker = _RetryTracker(cnf)
+
+        if isinstance(session, requests.Session):
+            session.request.side_effect = lambda *args, **kwargs: raise_requests_exception(TimeoutError())
+        else:
+            session.request.side_effect = httpx.ReadTimeout("test timeout", request=MagicMock())
+
         c = HTTPClient(
             config=cnf,
             refresh_auth_header=lambda headers: None,
             retry_tracker_factory=lambda _: retry_tracker,
-            session=MagicMock(
-                request=MagicMock(
-                    side_effect=lambda *args, **kwargs: raise_exception_wrapped_as_in_requests_lib(TimeoutError())
-                )
-            ),
+            session=session,
         )
 
         with pytest.raises(CogniteReadTimeout):
@@ -106,19 +117,21 @@ class TestHTTPClient:
         assert retry_tracker.status == 0
 
     @pytest.mark.parametrize("exc_type", [ConnectionAbortedError, ConnectionResetError, BrokenPipeError])
-    def test_connect_errors(self, exc_type):
+    def test_connect_errors(self, exc_type, session):
         cnf = DEFAULT_CONFIG
         cnf.max_backoff_seconds = 0
         retry_tracker = _RetryTracker(cnf)
+
+        if isinstance(session, requests.Session):
+            session.request.side_effect = lambda *args, **kwargs: raise_requests_exception(exc_type())
+        else:
+            session.request.side_effect = httpx.ConnectError("test connect error", request=MagicMock())
+
         c = HTTPClient(
             config=cnf,
             refresh_auth_header=lambda headers: None,
             retry_tracker_factory=lambda _: retry_tracker,
-            session=MagicMock(
-                request=MagicMock(
-                    side_effect=lambda *args, **kwargs: raise_exception_wrapped_as_in_requests_lib(exc_type())
-                )
-            ),
+            session=session,
         )
 
         with pytest.raises(CogniteConnectionError):
@@ -129,21 +142,21 @@ class TestHTTPClient:
         assert retry_tracker.connect == DEFAULT_CONFIG.max_retries_connect
         assert retry_tracker.status == 0
 
-    def test_connection_refused_retried(self):
+    def test_connection_refused_retried(self, session):
+        if not isinstance(session, requests.Session):
+            pytest.skip("httpx does not expose ConnectionRefusedError")
+
         cnf = DEFAULT_CONFIG
         cnf.max_backoff_seconds = 0
         retry_tracker = _RetryTracker(cnf)
+
+        session.request.side_effect = lambda *args, **kwargs: raise_requests_exception(ConnectionRefusedError())
+
         c = HTTPClient(
             config=cnf,
             refresh_auth_header=lambda headers: None,
             retry_tracker_factory=lambda _: retry_tracker,
-            session=MagicMock(
-                request=MagicMock(
-                    side_effect=lambda *args, **kwargs: raise_exception_wrapped_as_in_requests_lib(
-                        ConnectionRefusedError()
-                    )
-                )
-            ),
+            session=session,
         )
 
         with pytest.raises(CogniteConnectionRefused):
@@ -151,15 +164,21 @@ class TestHTTPClient:
 
         assert retry_tracker.total == DEFAULT_CONFIG.max_retries_connect
 
-    def test_status_errors(self):
+    def test_status_errors(self, session):
         cnf = DEFAULT_CONFIG
         cnf.max_backoff_seconds = 0
         retry_tracker = _RetryTracker(cnf)
+
+        if isinstance(session, requests.Session):
+            session.request.return_value = MagicMock(status_code=429, request=MagicMock())
+        else:
+            session.request.return_value = MagicMock(spec=httpx.Response, status_code=429, request=MagicMock())
+
         c = HTTPClient(
             config=cnf,
             refresh_auth_header=lambda headers: None,
             retry_tracker_factory=lambda _: retry_tracker,
-            session=MagicMock(request=MagicMock(return_value=MagicMock(status_code=429))),
+            session=session,
         )
 
         res = c.request("GET", "bla", headers={"accept": "application/json"})
